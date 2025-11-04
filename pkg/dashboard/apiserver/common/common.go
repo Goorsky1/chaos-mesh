@@ -27,7 +27,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/chaos-mesh/chaos-mesh/api/v1alpha1"
@@ -211,7 +213,7 @@ func (s *Service) listNamespaces(c *gin.Context) {
 }
 
 // @Summary Get all namespaces which could inject chaos(explosion scope) from Kubernetes cluster.
-// @Description Get all namespaces which could inject chaos(explosion scope) from Kubernetes cluster.
+// @Description Get all namespaces which could inject chaos(explosion scope) from Kubernetes cluster. Namespaces are filtered by what the user's token can access.
 // @Tags common
 // @Produce json
 // @Success 200 {array} string
@@ -220,6 +222,7 @@ func (s *Service) listNamespaces(c *gin.Context) {
 func (s *Service) getChaosAvailableNamespaces(c *gin.Context) {
 	var namespaces sort.StringSlice
 
+	// First, get all namespaces using controller token
 	if s.conf.ClusterScoped {
 		var nsList v1.NamespaceList
 		if err := s.kubeCli.List(context.Background(), &nsList); err != nil {
@@ -238,8 +241,45 @@ func (s *Service) getChaosAvailableNamespaces(c *gin.Context) {
 		namespaces = append(namespaces, s.conf.TargetNamespace)
 	}
 
-	sort.Sort(namespaces)
-	c.JSON(http.StatusOK, namespaces)
+	// Filter namespaces by user token access
+	authCli, err := clientpool.ExtractTokenAndGetAuthClient(c.Request.Header)
+	if err != nil {
+		// If no user token is provided, return all namespaces (backward compatibility)
+		s.logger.V(1).Info("No user token provided, returning all namespaces")
+		sort.Sort(namespaces)
+		c.JSON(http.StatusOK, namespaces)
+		return
+	}
+
+	// Filter namespaces that the user can access
+	ctx := c.Request.Context()
+	filteredNamespaces := make(sort.StringSlice, 0, len(namespaces))
+	for _, nsName := range namespaces {
+		// Check if user can access chaos resources in this namespace
+		sar := &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Namespace: nsName,
+					Verb:      "list",
+					Group:     "chaos-mesh.org",
+					Resource:  "*",
+				},
+			},
+		}
+
+		result, err := authCli.SelfSubjectAccessReviews().Create(ctx, sar, metav1.CreateOptions{})
+		if err != nil {
+			s.logger.V(1).Info("Failed to check namespace access, skipping", "namespace", nsName, "error", err)
+			continue
+		}
+
+		if result.Status.Allowed {
+			filteredNamespaces = append(filteredNamespaces, nsName)
+		}
+	}
+
+	sort.Sort(filteredNamespaces)
+	c.JSON(http.StatusOK, filteredNamespaces)
 }
 
 // @Summary Get all chaos kinds from Kubernetes cluster.
